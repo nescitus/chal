@@ -138,7 +138,7 @@ TTEntry tt[TT_SIZE];
 */
 
 typedef struct {
-    Move move; int piece_captured; int ep_square_prev; int castle_rights_prev; unsigned int hash_prev;
+    Move move; int piece_captured; int ep_square_prev; int castle_rights_prev; int halfmove_clock_prev; unsigned int hash_prev; int npc_prev[2];
 } State;
 
 State history[1024];
@@ -210,7 +210,9 @@ int side, xside;
 int ep_square;
 int castle_rights;    /* bits: 1=WO-O  2=WO-O-O  4=BO-O  8=BO-O-O */
 int king_sq[2];
+int non_pawn_count[2];
 int ply;
+int halfmove_clock;   /* plies since last pawn move or capture; draw at 100 */
 unsigned int hash_key;
 
 /* Search telemetry -- reported in UCI info lines */
@@ -405,7 +407,9 @@ static void add_promo(Move *list, int *n, int f, int t) {
 void make_move(Move m) {
     int f=FROM(m), t=TO(m), pr=PROMO(m), p=board[f], pt=TYPE(p), cap=board[t], ci;
     history[ply].move = m; history[ply].piece_captured = cap; history[ply].ep_square_prev = ep_square;
-    history[ply].castle_rights_prev = castle_rights; history[ply].hash_prev = hash_key;
+    history[ply].castle_rights_prev = castle_rights; history[ply].halfmove_clock_prev = halfmove_clock; history[ply].hash_prev = hash_key;
+    history[ply].npc_prev[WHITE]=non_pawn_count[WHITE]; history[ply].npc_prev[BLACK]=non_pawn_count[BLACK];
+    halfmove_clock = (pt == PAWN || cap) ? 0 : halfmove_clock + 1;
 
     if (pt==PAWN && t==ep_square) {
         int ep_pawn = t + (side==WHITE ? -16 : 16);
@@ -414,9 +418,10 @@ void make_move(Move m) {
     }
     board[t]=p; board[f]=EMPTY;
     TOGGLE(side, pt, f); TOGGLE(side, pt, t);
-    if (cap) TOGGLE(xside, TYPE(cap), t);
+    if (cap) { TOGGLE(xside, TYPE(cap), t); if (TYPE(cap)>=KNIGHT && TYPE(cap)<=QUEEN) non_pawn_count[xside]--; }
 
-    if (pr) { board[t] = PIECE(side,pr); TOGGLE(side, pt, t); TOGGLE(side, pr, t); }
+    if (pr) { board[t] = PIECE(side,pr); TOGGLE(side, pt, t); TOGGLE(side, pr, t);
+              non_pawn_count[side]++; } /* pawn promoted to piece */
 
     hash_key ^= zobrist_castle[castle_rights];
     if (pt==KING) {
@@ -458,6 +463,8 @@ void undo_move(void) {
         }
     }
     ep_square = history[ply].ep_square_prev; castle_rights = history[ply].castle_rights_prev;
+    halfmove_clock = history[ply].halfmove_clock_prev;
+    non_pawn_count[WHITE]=history[ply].npc_prev[WHITE]; non_pawn_count[BLACK]=history[ply].npc_prev[BLACK];
     hash_key = history[ply].hash_prev; /* O(1) restore */
 }
 
@@ -582,6 +589,7 @@ void parse_fen(const char *fen) {
 
     for (i=0;i<128;i++) board[i]=EMPTY;
     castle_rights=0; ep_square=SQ_NONE; ply=0;
+    non_pawn_count[WHITE]=0; non_pawn_count[BLACK]=0;
     memset(killers,0,sizeof(killers)); memset(pv,0,sizeof(pv));
     memset(pv_length,0,sizeof(pv_length)); memset(hist,0,sizeof(hist));
 
@@ -592,6 +600,7 @@ void parse_fen(const char *fen) {
             sq=rank*16+file; color=isupper(*fen)?WHITE:BLACK; lo=(char)tolower(*fen);
             piece=(lo=='p')?PAWN:(lo=='n')?KNIGHT:(lo=='b')?BISHOP:(lo=='r')?ROOK:(lo=='q')?QUEEN:KING;
             board[sq]=PIECE(color,piece); if (piece==KING) king_sq[color]=sq;
+            if (piece>=KNIGHT && piece<=QUEEN) non_pawn_count[color]++;
             file++;
         }
         fen++;
@@ -609,6 +618,11 @@ void parse_fen(const char *fen) {
     fen++;
 
     if (*fen!='-') ep_square=(fen[1]-'1')*16+(fen[0]-'a');
+
+    /* advance past ep field, then read halfmove clock */
+    while (*fen && *fen != ' ') fen++;
+    halfmove_clock = 0;
+    if (*fen == ' ') { fen++; halfmove_clock = atoi(fen); }
 }
 
 /* ===============================================================
@@ -743,7 +757,7 @@ int evaluate(void) {
                     target += step;
                 }
             }
-            score += sign * (pt==QUEEN ? 1 : 2) * mob;
+            score += sign * (pt==QUEEN ? 2 : 3) * mob;
         }
 
         if (pt==BISHOP) {
@@ -879,17 +893,20 @@ static void sort_moves(Move *moves, int n, Move hash_move, int depth) {
    Extra heuristics layered on top:
    1. Quiescence Search (QS): at depth 0, keep searching captures
       until the position is "quiet" to avoid the horizon effect.
-   2. Null Move Pruning (NMP): pass our turn; if the opponent still
+   2. Reverse Futility Pruning (RFP): at shallow depths, if the static
+      eval minus a margin already beats beta, skip the search entirely.
+      Zero nodes spent -- much cheaper than NMP.
+   3. Null Move Pruning (NMP): pass our turn; if the opponent still
       can't beat beta at reduced depth, prune without searching.
-   3. Late Move Reductions (LMR): search late quiet moves at depth-2
+   4. Late Move Reductions (LMR): search late quiet moves at depth-2
       instead of depth-1; re-search at full depth only if the score
       beats alpha.
-   4. Transposition Table (TT): cache each sub-tree result by Zobrist
+   5. Transposition Table (TT): cache each sub-tree result by Zobrist
       key so the same position via different move orders is only
       searched once.
-   5. Aspiration Windows: start each iterative-deepening depth with a
+   6. Aspiration Windows: start each iterative-deepening depth with a
       narrow window around the previous score; widen on failure.
-   6. Repetition detection: return 0 (draw) when the Zobrist key
+   7. Repetition detection: return 0 (draw) when the Zobrist key
       matches a previous position, preventing perpetual-check traps.
 */
 
@@ -897,6 +914,11 @@ int search(int depth, int alpha, int beta) {
     Move moves[256], best=0, hash_move=0;
     int cnt, i, legal=0, best_sc, old_alpha=alpha, sc, caps_only;
     TTEntry *e = &tt[hash_key % TT_SIZE];
+
+    /* Clear PV at this ply before any early returns (TT hits, stand-pat, repetition).
+       If we return early the parent reads pv_length[sply] to know how much of the
+       child continuation to copy; it must equal sply (empty) not a stale value. */
+    pv_length[sply] = sply;
 
     /* HARD TIME LIMIT CHECK
        Every 1024 nodes, check if we have exceeded our absolute time budget.
@@ -922,6 +944,9 @@ int search(int depth, int alpha, int beta) {
         }
     }
 
+    /* 50-move rule: 100 half-moves without a pawn move or capture = draw */
+    if (halfmove_clock >= 100) return 0;
+
     /* TT probe: always extract hash_move for ordering */
     if (e->key==hash_key) {
         hash_move=e->best_move;
@@ -945,9 +970,18 @@ int search(int depth, int alpha, int beta) {
     }
 
     nodes_searched++;
-    pv_length[sply] = sply;   /* default: PV ends here */
 
-   /* NULL MOVE PRUNING (NMP)
+    /* REVERSE FUTILITY PRUNING (RFP / Static Null Move Pruning)
+       static_eval is computed once and reused; no second evaluate() call. */
+    if (!caps_only && depth >= 1 && depth <= 7
+        && beta < MATE - MAX_PLY
+        && !is_square_attacked(king_sq[side], xside)) {
+        int static_eval = evaluate();
+        if (static_eval - 70 * depth >= beta)
+            return static_eval - 70 * depth;
+    }
+
+    /* NULL MOVE PRUNING (NMP)
        Skip our turn; if the opponent still cannot beat beta at reduced
        depth, prune immediately. R=2 normally, R=3 at depth >= 6.
 
@@ -955,27 +989,21 @@ int search(int depth, int alpha, int beta) {
        passing really is the worst move. We skip NMP when the side to
        move has no non-pawn non-king piece, making the null move
        assumption safe in all normal middlegame and endgame positions.  */
-    if (!caps_only && depth >= 3 && !is_square_attacked(king_sq[side], xside)) {
-        int sq_scan, has_piece = 0, ep_sq_prev, R;
-        FOR_EACH_SQ(sq_scan) {
-            int pt_scan = TYPE(board[sq_scan]);
-            if (board[sq_scan] && COLOR(board[sq_scan]) == side
-                && pt_scan != PAWN && pt_scan != KING) { has_piece = 1; break; }
-        }
-        if (has_piece) {
-            R = (depth >= 6) ? 3 : 2;
-            ep_sq_prev = ep_square;
-            hash_key ^= zobrist_side;
-            if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
-            ep_square = SQ_NONE;
-            side ^= 1; xside ^= 1; ply++;
-            sc = -search(depth - R - 1, -beta, -beta + 1);
-            side ^= 1; xside ^= 1; ply--;
-            ep_square = ep_sq_prev;
-            if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
-            hash_key ^= zobrist_side;
-            if (sc >= beta) return beta;
-        }
+    if (!caps_only && depth >= 3 && non_pawn_count[side] > 0
+        && !is_square_attacked(king_sq[side], xside)) {
+        int ep_sq_prev, R;
+        R = (depth >= 6) ? 3 : 2;
+        ep_sq_prev = ep_square;
+        hash_key ^= zobrist_side;
+        if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
+        ep_square = SQ_NONE;
+        side ^= 1; xside ^= 1; ply++;
+        sc = -search(depth - R - 1, -beta, -beta + 1);
+        side ^= 1; xside ^= 1; ply--;
+        ep_square = ep_sq_prev;
+        if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
+        hash_key ^= zobrist_side;
+        if (sc >= beta) return beta;
     }
 
     cnt=generate_moves(moves, caps_only);
@@ -1042,8 +1070,8 @@ int search(int depth, int alpha, int beta) {
     if (!caps_only && !legal)
         return is_square_attacked(king_sq[side],xside) ? -(MATE-sply) : 0;
 
-    /* TT store with depth-preferred replacement */
-    if (best && (e->key!=hash_key || depth>=(int)TT_DEPTH(e))) {
+    /* TT store: skip if search was aborted mid-tree (score is meaningless) */
+    if (!time_over_flag && best && (e->key!=hash_key || depth>=(int)TT_DEPTH(e))) {
         int flag = (best_sc<=old_alpha)?TT_ALPHA:(best_sc>=beta)?TT_BETA:TT_EXACT;
         e->key=hash_key; e->score=best_sc; e->best_move=best; e->depth_flag=TT_PACK(depth>0?depth:0, flag);
     }
@@ -1096,6 +1124,7 @@ static void print_pv(void) {
 void search_root(int max_depth) {
     Move moves[256], global_best=0, iter_best;
     int cnt=generate_moves(moves,0), d, i, sc, best_sc=-INF, legal_root=0;
+    long total_nodes=0;
 
     time_over_flag = 0;
     t_start = clock();
@@ -1182,6 +1211,7 @@ void search_root(int max_depth) {
             }
         } while (asp_failed && !time_over_flag);
 
+        total_nodes += nodes_searched;
         if (time_over_flag) break; /* Don't use incomplete depth data */
 
         if (iter_best) global_best=iter_best;
@@ -1206,13 +1236,13 @@ void search_root(int max_depth) {
             long ms=(long)((clock()-t_start)*1000/CLOCKS_PER_SEC);
             if (best_sc > MATE - MAX_PLY)
                 printf("info depth %d score mate %d nodes %ld time %ld pv",
-                       d, (MATE - best_sc + 1)/2, nodes_searched, ms);
+                       d, (MATE - best_sc + 1)/2, total_nodes, ms);
             else if (best_sc < -(MATE - MAX_PLY))
                 printf("info depth %d score mate %d nodes %ld time %ld pv",
-                       d, -(MATE + best_sc + 1)/2, nodes_searched, ms);
+                       d, -(MATE + best_sc + 1)/2, total_nodes, ms);
             else
                 printf("info depth %d score cp %d nodes %ld time %ld pv",
-                       d, best_sc, nodes_searched, ms);
+                       d, best_sc, total_nodes, ms);
             print_pv();
             printf("\n");
             fflush(stdout);

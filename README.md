@@ -1,6 +1,6 @@
 # Chal
 
-**Chal** is a complete, FIDE-rules-compliant chess engine in **776 lines of C90** it has one file, no dependencies, no magic.
+**Chal** is a complete, FIDE-rules-compliant chess engine in **792 lines of C90** it has one file, no dependencies, no magic.
 
 The name is Gujarati for "move." The goal is not to be the strongest engine, but the most readable one. Every subsystem such as move generation, search, evaluation, UCI fits in a single scroll. The source is written to be studied.
 
@@ -11,6 +11,7 @@ A lot of minimal engines cut corners: no en passant, no underpromotion, bugged c
 - En passant, all four underpromotions
 - Castling rights stripped correctly when a rook is captured at its home square
 - 2-fold repetition detection (same hash, same side to move)
+- 50-move rule (halfmove clock maintained incrementally and read from FEN)
 - Stalemate and checkmate reported correctly to the GUI
 
 It speaks UCI properly by streaming `info depth … score cp … pv` lines with the full principal variation during search, responding to `isready` before any position is set, handling `ucinewgame` with a clean TT flush.
@@ -41,10 +42,12 @@ There are no abstractions introduced for their own sake. No classes, no polymorp
 - **Negamax alpha-beta** with a triangular PV table. The full planned line is tracked at every node and printed on every `info` line.
 - **Iterative deepening** — depth 1, 2, … up to the limit. Each completed depth feeds the next via the TT best-move, making the overhead near zero.
 - **Aspiration windows** — full window at depths 1–3; ±50 cp window from depth 4. Delta doubles on fail-low or fail-high.
-- **Null move pruning** — R=2 (R=3 at depth ≥ 6). Guarded against zugzwang: skipped when the side to move has no non-pawn, non-king piece.
+- **Reverse futility pruning** — at depths 1–7, if static eval − 70·depth ≥ β, prune without searching any moves. Zero nodes spent per pruned node.
+- **Null move pruning** — R=2 (R=3 at depth ≥ 6). Guarded against zugzwang: skipped when the side to move has no non-pawn, non-king piece. Guard is O(1) via an incrementally-maintained `non_pawn_count[2]` table.
 - **Late move reductions** — quiet moves after the 4th at depth ≥ 3 are searched at depth−2 with a null window; re-searched at depth−1 only if they beat alpha.
 - **Quiescence search** — stand-pat evaluation with delta pruning; capped at 6 plies beyond the horizon.
 - **Repetition detection** — returns 0 immediately on a hash match (step by 2, bounded to the last 50 half-moves).
+- **50-move rule** — halfmove clock tracked incrementally in `make_move`, read from FEN field 5; search returns draw score at 100 half-moves.
 
 ### Move ordering
 
@@ -67,7 +70,7 @@ All terms are white-perspective centipawns; returned from side-to-move's perspec
 - **Material** — standard centipawn values (P=100, N=320, B=330, R=500, Q=900).
 - **Piece-square tables** — `pst[8][64]` signed-char array, one row per piece type. King uses two rows blended by phase.
 - **Game phase** — interpolated from total non-pawn material; smoothly transitions king evaluation from middlegame safety to endgame centralisation.
-- **Mobility** — pseudo-legal reachable squares. Knights, bishops, rooks score +2 cp each; queens +1 cp.
+- **Mobility** — pseudo-legal reachable squares. Knights, bishops, rooks score +3 cp each; queens +2 cp.
 - **Bishop pair** — +30 cp.
 - **Rook activity** — semi-open file +10, open file +20, 7th rank +20.
 - **Passed pawns** — rank² × 2 bonus (2 → 8 → 18 → 32 → 50 → 72 cp).
