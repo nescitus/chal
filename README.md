@@ -1,6 +1,6 @@
 # Chal
 
-**Chal** is a complete, FIDE-rules-compliant chess engine in **891 lines of C99** it has one file, no dependencies, no magic.
+**Chal** is a complete, FIDE-rules-compliant chess engine in **919 lines of C99** it has one file, no dependencies, no magic.
 
 The name is Gujarati for "move." The goal is not to be the strongest engine, but the most readable one. Every subsystem such as move generation, search, evaluation, UCI fits in a single scroll. The source is written to be studied.
 
@@ -44,7 +44,7 @@ There are no abstractions introduced for their own sake. No classes, no polymorp
 - **Iterative deepening** — depth 1, 2, … up to the limit. Each completed depth feeds the next via the TT best-move, making the overhead near zero.
 - **Aspiration windows** — full window at depths 1–3; ±50 cp window from depth 4. Delta doubles on fail-low or fail-high.
 - **Reverse futility pruning** — at depths 1–7, if static eval − 70·depth ≥ β, prune without searching any moves. Zero nodes spent per pruned node.
-- **Null move pruning** — R=3 (R=4 at depth ≥ 7). Guarded against zugzwang: skipped when the side to move has no non-pawn, non-king piece. Guard is O(1) via an incrementally-maintained `non_pawn_count[2]` table. Double null moves prevented by a `was_null` flag.
+- **Null move pruning** — R=3 (R=4 at depth ≥ 7). Guarded against zugzwang: skipped when the side to move has no non-pawn, non-king piece. Guard is O(1) via incrementally-maintained per-piece-type counts `piece_count[2][6]`. Double null moves prevented by a `was_null` flag.
 - **Principal variation search** — first legal move at each node gets the full window; all later moves are probed with a null window and only re-searched at full depth on a fail-high.
 - **Late move reductions (adaptive LMR)** — a precomputed table gives reduction R = round(ln(depth) × ln(move_number) / 1.6), clamped to [1, 5]. Captures, promotions, and check-giving moves are never reduced. R grows an extra ply on non-PV nodes. Any move whose reduced score beats alpha is re-searched at full depth.
 - **Quiescence search** — fail-soft stand-pat with delta pruning.
@@ -72,7 +72,8 @@ All terms are from the side-to-move's perspective; middlegame and endgame scores
 
 - **Tapered evaluation** — separate MG and EG scores blended as `(mg×phase + eg×(24−phase)) / 24`, where phase counts remaining piece material (24 = opening, 0 = pure endgame).
 - **Material** — Rofchade Texel-tuned values: MG P=82 N=337 B=365 R=477 Q=1025; EG P=94 N=281 B=297 R=512 Q=936.
-- **Piece-square tables** — `mg_pst[6][64]` and `eg_pst[6][64]`, Rofchade PeSTO tables. Passed-pawn rewards are folded implicitly into the EG pawn table.
+- **Piece-square tables** — `mg_pst[6][64]` and `eg_pst[6][64]`, Rofchade PeSTO tables with enhanced tuning. Passed pawns receive explicit detection and rank-dependent bonuses.
+- **Pawn evaluation** — includes passed pawn detection (no opposing pawn on the path), with rank-multiplied bonuses and endgame reinforcement for advanced passers.
 - **Mobility** — pseudo-legal reachable squares above a per-piece centre target. Knights, bishops, rooks ±3 cp/sq; queens ±2 cp/sq; applied to both MG and EG.
 - **Bishop pair** — +30 cp in both MG and EG.
 - **Rook activity** — semi-open file +10, open file +20, 7th rank +20; applied to both MG and EG.
@@ -134,8 +135,7 @@ go wtime 60000 btime 60000 movestogo 40
 
 ## Acknowledgements
 
-**Pawel Koziol** ([nescitus](https://github.com/nescitus)) — for thorough testing, bug reports, and architectural guidance throughout the v1.2.1 → v1.3.1 history.
-His feedback directly shaped the killer-move ply-indexing fix, the NMP ply-bookkeeping refactor, the PeSTO evaluation upgrade, the lazy pick-move sort, and the history malus + formula in v1.3.1.
+**Pawel Koziol** ([nescitus](https://github.com/nescitus)) — for thorough testing, bug reports, and architectural guidance throughout development. His feedback directly shaped the killer-move ply-indexing fix, the NMP ply-bookkeeping refactor, the PeSTO evaluation upgrade, the lazy pick-move sort, the history malus + formula in v1.3.1, and the pawn evaluation refinements, state structure refactoring, and search clarity initiatives in v1.3.2.
 
 **Anik Patel** ([Bobingstern](https://github.com/Bobingstern)) — for guiding the SPRT testing setup using [fastchess](https://github.com/Disservin/fastchess), making it possible to measure strength gains objectively across versions.
 
