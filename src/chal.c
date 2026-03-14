@@ -142,7 +142,7 @@ static inline unsigned int tt_pack(int d, int f) { return (unsigned int)((d << 2
 */
 
 typedef struct {
-    Move move; int piece_captured; int ep_square_prev; unsigned int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev; int npc_prev[2];
+    Move move; int piece_captured; int ep_square_prev; unsigned int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev;
 } State;
 
 State history[1024];
@@ -215,7 +215,7 @@ int side, xside;
 int ep_square;
 unsigned int castle_rights;    /* bits: 1=WO-O  2=WO-O-O  4=BO-O  8=BO-O-O */
 int king_sq[2];
-int non_pawn_count[2];
+int count[2][7];  /* count[color][piece_type], piece_type 1..6 */
 int ply;
 int halfmove_clock;   /* plies since last pawn move or capture; draw at 100 */
 HASH hash_key;
@@ -425,21 +425,21 @@ void make_move(Move m) {
     int f = move_from(m), t = move_to(m), pr = move_promo(m), p = board[f], pt = piece_type(p), cap = board[t];
     history[ply].move = m; history[ply].piece_captured = cap; history[ply].ep_square_prev = ep_square;
     history[ply].castle_rights_prev = castle_rights; history[ply].halfmove_clock_prev = halfmove_clock; history[ply].hash_prev = hash_key;
-    history[ply].npc_prev[WHITE] = non_pawn_count[WHITE]; history[ply].npc_prev[BLACK] = non_pawn_count[BLACK];
     halfmove_clock = (pt == PAWN || cap) ? 0 : halfmove_clock + 1;
 
     if (pt == PAWN && t == ep_square) {
         int ep_pawn = t + (side == WHITE ? -16 : 16);
         history[ply].piece_captured = board[ep_pawn]; board[ep_pawn] = EMPTY;
         toggle(xside, PAWN, ep_pawn);
+        count[xside][PAWN]--;
     }
     board[t] = p; board[f] = EMPTY;
     toggle(side, pt, f); toggle(side, pt, t);
-    if (cap) { toggle(xside, piece_type(cap), t); if (piece_type(cap) >= KNIGHT && piece_type(cap) <= QUEEN) non_pawn_count[xside]--; }
+    if (cap) { toggle(xside, piece_type(cap), t); count[xside][piece_type(cap)]--; }
 
     if (pr) {
         board[t] = make_piece(side, pr); toggle(side, pt, t); toggle(side, pr, t);
-        non_pawn_count[side]++;
+        count[side][PAWN]--; count[side][pr]++;
     } /* pawn promoted to piece */
 
     hash_key ^= zobrist_castle[castle_rights];
@@ -467,12 +467,16 @@ void make_move(Move m) {
 void undo_move(void) {
     ply--; side ^= 1; xside ^= 1;
     Move m = history[ply].move; int f = move_from(m), t = move_to(m), pr = move_promo(m);
-    board[f] = board[t]; board[t] = history[ply].piece_captured;
-    if (pr) board[f] = make_piece(side, PAWN);
+    int cap = history[ply].piece_captured;
+    board[f] = board[t]; board[t] = cap;
+    if (pr) { board[f] = make_piece(side, PAWN); count[side][pr]--; count[side][PAWN]++; }
     int pt = piece_type(board[f]);
 
     if (pt == PAWN && t == history[ply].ep_square_prev) {
-        board[t] = EMPTY; board[t + (side == WHITE ? -16 : 16)] = history[ply].piece_captured;
+        board[t] = EMPTY; board[t + (side == WHITE ? -16 : 16)] = cap;
+        count[xside][PAWN]++;
+    } else if (cap) {
+        count[xside][piece_type(cap)]++;
     }
     if (pt == KING) {
         king_sq[side] = f;
@@ -484,7 +488,6 @@ void undo_move(void) {
     }
     ep_square = history[ply].ep_square_prev; castle_rights = history[ply].castle_rights_prev;
     halfmove_clock = history[ply].halfmove_clock_prev;
-    non_pawn_count[WHITE] = history[ply].npc_prev[WHITE]; non_pawn_count[BLACK] = history[ply].npc_prev[BLACK];
     hash_key = history[ply].hash_prev; /* O(1) restore */
 }
 
@@ -620,7 +623,7 @@ void parse_fen(const char* fen) {
     for (int i = 0; i < 128; i++) board[i] = EMPTY;
     king_sq[WHITE] = king_sq[BLACK] = SQ_NONE;
     castle_rights = 0; ep_square = SQ_NONE; ply = 0; hash_key = 0;
-    non_pawn_count[WHITE] = 0; non_pawn_count[BLACK] = 0;
+    memset(count, 0, sizeof(count));
     memset(killers, 0, sizeof(killers)); memset(pv, 0, sizeof(pv));
     memset(pv_length, 0, sizeof(pv_length)); memset(hist, 0, sizeof(hist));
 
@@ -632,7 +635,7 @@ void parse_fen(const char* fen) {
             int piece = char_to_piece(lo);
             if (piece == EMPTY) { fen++; continue; }
             board[sq] = make_piece(color, piece); if (piece == KING) king_sq[color] = sq;
-            if (piece >= KNIGHT && piece <= QUEEN) non_pawn_count[color]++;
+            count[color][piece]++;
             file++;
         }
         fen++;
@@ -776,7 +779,6 @@ static const int mob_step_eg[7] = { 0, 0, 3, 4, 4, 2, 0 };
 
 int evaluate(void) {
     int mg[2], eg[2], phase;
-    int bishops[2];
     int pawn_cnt[2][8];
     int lowest_pawn_rank[2][8];
     int pseudo_list[32]; /* occupied squares built during first pass (Pawel Koziol) */
@@ -788,7 +790,6 @@ int evaluate(void) {
     int pawn_sq_cnt[2];
 
     mg[WHITE] = mg[BLACK] = eg[WHITE] = eg[BLACK] = phase = 0;
-    bishops[WHITE] = bishops[BLACK] = 0;
     memset(pawn_cnt, 0, sizeof(pawn_cnt));
     pawn_sq_cnt[WHITE] = pawn_sq_cnt[BLACK] = 0;
     for (int i = 0; i < 8; i++) {
@@ -844,10 +845,6 @@ int evaluate(void) {
                 eg[color] += mob_step_eg[pt] * mob;
             }
 
-            if (pt == BISHOP) {
-                bishops[color]++;
-                if (bishops[color] == 2) { mg[color] += 31; eg[color] += 30; } /* bishop pair */
-            }
             if (pt == PAWN) {
                 pawn_cnt[color][f]++;
                 if (pawn_sq_cnt[color] < 8)
@@ -855,6 +852,10 @@ int evaluate(void) {
             }
         }
     }
+
+    /* Bishop pair bonus using incremental count */
+    for (int c = 0; c < 2; c++)
+        if (count[c][BISHOP] >= 2) { mg[c] += 31; eg[c] += 30; }
 
     /* Pawn structure and king safety (requires full pawn_cnt) */
     for (int color = 0; color < 2; color++) {
@@ -961,7 +962,8 @@ int evaluate(void) {
         int sq = pseudo_list[i], p = board[sq];
         int pt = piece_type(p), color = piece_color(p), f = sq & 7;
         if (pt == ROOK) {
-            int rank = sq >> 4, bonus = 0;
+            // int rank = sq >> 4;
+            int bonus = 0;
             if (pawn_cnt[color][f] == 0)
                 bonus += (pawn_cnt[color ^ 1][f] == 0) ? 20 : 10; /* open/semi-open file */
             // no rook on 7th eval, piece/square tables will take care of that
@@ -1197,19 +1199,18 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
     if (halfmove_clock >= 100) return 0;
 
     /* INSUFFICIENT MATERIAL
-       KK, KNK, KBK -- no pawns and at most one minor piece.
+       KK, KNK, KBK -- no pawns and at most one minor piece per side.
        KRK and KQK are NOT draws -- rooks and queens can force checkmate.
-       non_pawn_count is maintained incrementally so the common case is O(1);
-       the board scan only runs when the count actually qualifies.            */
-    if (non_pawn_count[WHITE] + non_pawn_count[BLACK] <= 1) {
-        int s2, has_pawn = 0, has_major = 0;
-        FOR_EACH_SQ(s2) {
-            int pt = piece_type(board[s2]);
-            if (pt == PAWN)                has_pawn = 1;
-            if (pt == ROOK || pt == QUEEN) has_major = 1;
-        }
-        if (!has_pawn && !has_major) return 0;
-    }
+       All O(1) via count[color][piece_type].                            */
+    // {
+    //     int wp = count[WHITE][PAWN], bp = count[BLACK][PAWN];
+    //     int wminor = count[WHITE][KNIGHT] + count[WHITE][BISHOP];
+    //     int bminor = count[BLACK][KNIGHT] + count[BLACK][BISHOP];
+    //     int wmajor = count[WHITE][ROOK] + count[WHITE][QUEEN];
+    //     int bmajor = count[BLACK][ROOK] + count[BLACK][QUEEN];
+    //     if (!wp && !bp && !wmajor && !bmajor && wminor <= 1 && bminor <= 1)
+    //         return 0;
+    // }
 
     /* TT probe: always extract hash_move for ordering */
     if (e->key == hash_key) {
@@ -1262,7 +1263,8 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
        passing really is the worst move. We skip NMP when the side to
        move has no non-pawn non-king piece, making the null move
        assumption safe in all normal middlegame and endgame positions.  */
-    if (!caps_only && !is_pv && !was_null && depth >= 3 && non_pawn_count[side] > 0
+    if (!caps_only && !is_pv && !was_null && depth >= 3
+        && (count[side][KNIGHT] + count[side][BISHOP] + count[side][ROOK] + count[side][QUEEN] > 0)
         && !in_check(side)) {
         int R = (depth >= 7) ? 4 : 3;
         int ep_sq_prev = ep_square;
@@ -1745,4 +1747,4 @@ int main(void) {
     setbuf(stdout, NULL);
     uci_loop();
     return 0;
-} 
+}
