@@ -777,6 +777,12 @@ static const int mob_center[7] = { 0, 0, 4, 6, 6, 13, 0 };
 static const int mob_step_mg[7] = { 0, 0, 3, 4, 3, 2, 0 };
 static const int mob_step_eg[7] = { 0, 0, 3, 4, 4, 2, 0 };
 
+static inline int max(int a, int b) { return a > b ? a : b; }
+ 
+static inline int distance(int s1, int s2) {
+    return max(abs((s1 & 7) - (s2 & 7)), abs((s1 >> 4) - (s2 >> 4)));
+}
+
 static inline void add_score(int* mg, int* eg, int color, int mg_v, int eg_v) {
     mg[color] += mg_v; eg[color] += eg_v;
 }
@@ -925,20 +931,12 @@ int evaluate(void) {
             int bonus_mg = pp_mg[own_rank];
             int bonus_eg = pp_eg[own_rank];
 
-            {
-                int own_ksq = king_sq[color];
-                int enemy_ksq = king_sq[enemy];
-                int dist_own   = abs(file - (own_ksq & 7))   > abs(rank - (own_ksq >> 4))   ? abs(file - (own_ksq & 7))   : abs(rank - (own_ksq >> 4));
-                int dist_enemy = abs(file - (enemy_ksq & 7)) > abs(rank - (enemy_ksq >> 4)) ? abs(file - (enemy_ksq & 7)) : abs(rank - (enemy_ksq >> 4));
-                bonus_eg += 4 * (dist_enemy - dist_own);
-            }
-
-            {
-                int front = sq + (color == WHITE ? 16 : -16);
-                if (!sq_is_off(front) && board[front] && piece_color(board[front]) == enemy) {
-                    bonus_mg /= 2;
-                    bonus_eg /= 2;
-                }
+            bonus_eg += 4 * (distance(sq, king_sq[enemy]) - distance(sq, king_sq[color]));
+            
+            int front = sq + (color == WHITE ? 16 : -16);
+            if (!sq_is_off(front) && board[front] && piece_color(board[front]) == enemy) {
+                bonus_mg /= 2;
+                bonus_eg /= 2;
             }
 
             add_score(mg, eg, color, bonus_mg, bonus_eg);
