@@ -777,6 +777,10 @@ static const int mob_center[7] = { 0, 0, 4, 6, 6, 13, 0 };
 static const int mob_step_mg[7] = { 0, 0, 3, 4, 3, 2, 0 };
 static const int mob_step_eg[7] = { 0, 0, 3, 4, 4, 2, 0 };
 
+static inline void add_score(int* mg, int* eg, int color, int mg_v, int eg_v) {
+    mg[color] += mg_v; eg[color] += eg_v;
+}
+
 int evaluate(void) {
     int mg[2], eg[2], phase;
     int pawn_cnt[2][8];
@@ -808,11 +812,13 @@ int evaluate(void) {
             pseudo_list[index++] = sq;                    /* memorize (Pawel) */
             int pt = piece_type(p), color = piece_color(p);
 
-            /* Set loweest rank on which there is a pawn */
             if (pt == PAWN) {
                 int own_rank = (color == WHITE) ? rank : (7 - rank);
                 if (own_rank < lowest_pawn_rank[color][f])
                     lowest_pawn_rank[color][f] = own_rank;
+                pawn_cnt[color][f]++;
+                if (pawn_sq_cnt[color] < 8)
+                    pawn_sq[color][pawn_sq_cnt[color]++] = sq;
             }
 
             /* Square index: rank 0 = White's back rank.
@@ -821,8 +827,7 @@ int evaluate(void) {
 
             /* Material + PST: scored into MG and EG accumulators separately.
                pt-1 converts TYPE() (1-based) to the 0-based table index. */
-            mg[color] += mg_val[pt - 1] + mg_pst[pt - 1][idx];
-            eg[color] += eg_val[pt - 1] + eg_pst[pt - 1][idx];
+            add_score(mg, eg, color, mg_val[pt - 1] + mg_pst[pt - 1][idx], eg_val[pt - 1] + eg_pst[pt - 1][idx]);
             phase += phase_inc[pt];
 
             /* Mobility: count pseudo-legal reachable squares, centered so that
@@ -841,31 +846,24 @@ int evaluate(void) {
                     }
                 }
                 mob -= mob_center[pt];
-                mg[color] += mob_step_mg[pt] * mob;
-                eg[color] += mob_step_eg[pt] * mob;
-            }
-
-            if (pt == PAWN) {
-                pawn_cnt[color][f]++;
-                if (pawn_sq_cnt[color] < 8)
-                    pawn_sq[color][pawn_sq_cnt[color]++] = sq;
+                add_score(mg, eg, color, mob_step_mg[pt] * mob, mob_step_eg[pt] * mob);
             }
         }
     }
 
     /* Bishop pair bonus using incremental count */
     for (int c = 0; c < 2; c++)
-        if (count[c][BISHOP] >= 2) { mg[c] += 31; eg[c] += 30; }
+        if (count[c][BISHOP] >= 2) add_score(mg, eg, c, 31, 30);
 
     /* Pawn structure and king safety (requires full pawn_cnt) */
     for (int color = 0; color < 2; color++) {
         for (int f = 0; f < 8; f++) {
             int cnt = pawn_cnt[color][f];
-            if (cnt > 1) { mg[color] -= (cnt - 1) * 20; eg[color] -= (cnt - 1) * 20; } /* Doubled */
+            if (cnt > 1) add_score(mg, eg, color, -(cnt - 1) * 20, -(cnt - 1) * 20); /* Doubled */
             if (cnt) {
                 int left = (f > 0) ? pawn_cnt[color][f - 1] : 0;
                 int right = (f < 7) ? pawn_cnt[color][f + 1] : 0;
-                if (!left && !right) { mg[color] -= 10; eg[color] -= 10; } /* Isolated */
+                if (!left && !right) add_score(mg, eg, color, -10, -10); /* Isolated */
             }
         }
         /* King pawn shield -- MG only.
@@ -873,20 +871,17 @@ int evaluate(void) {
            EG king PST; a pawn shield is irrelevant and would only hurt. */
 
         static const int shield_val[8] = { 0, 12, 4, -2, -2, 0, 0, -12 };
-
-        {
-            int ksq = king_sq[color], kf = ksq & 7;
-            if (kf <= 2 || kf >= 5) {
-                int shield = 0;
-                for (int f_test = kf - 1; f_test <= kf + 1; f_test++) {
-                    if (f_test >= 0 && f_test <= 7) {
-                        shield += shield_val[lowest_pawn_rank[color][f_test]];
-                        if (lowest_pawn_rank[color][f_test] == 7)
-                            shield -= 18 * (lowest_pawn_rank[color ^ 1][f_test] == 7);
-                    }
+        int ksq = king_sq[color], kf = ksq & 7;
+        if (kf <= 2 || kf >= 5) {
+            int shield = 0;
+            for (int f_test = kf - 1; f_test <= kf + 1; f_test++) {
+                if (f_test >= 0 && f_test <= 7) {
+                    shield += shield_val[lowest_pawn_rank[color][f_test]];
+                    if (lowest_pawn_rank[color][f_test] == 7)
+                        shield -= 18 * (lowest_pawn_rank[color ^ 1][f_test] == 7);
                 }
-                mg[color] += shield;
             }
+            mg[color] += shield;
         }
     }
 
@@ -933,14 +928,9 @@ int evaluate(void) {
             {
                 int own_ksq = king_sq[color];
                 int enemy_ksq = king_sq[enemy];
-                int fd_own = file - (own_ksq & 7); if (fd_own < 0) fd_own = -fd_own;
-                int rd_own = rank - (own_ksq >> 4); if (rd_own < 0) rd_own = -rd_own;
-                int fd_enemy = file - (enemy_ksq & 7); if (fd_enemy < 0) fd_enemy = -fd_enemy;
-                int rd_enemy = rank - (enemy_ksq >> 4); if (rd_enemy < 0) rd_enemy = -rd_enemy;
-                int dist_own = fd_own > rd_own ? fd_own : rd_own;
-                int dist_enemy = fd_enemy > rd_enemy ? fd_enemy : rd_enemy;
-                bonus_eg += 4 * (7 - dist_own);
-                bonus_eg -= 4 * (7 - dist_enemy);
+                int dist_own   = abs(file - (own_ksq & 7))   > abs(rank - (own_ksq >> 4))   ? abs(file - (own_ksq & 7))   : abs(rank - (own_ksq >> 4));
+                int dist_enemy = abs(file - (enemy_ksq & 7)) > abs(rank - (enemy_ksq >> 4)) ? abs(file - (enemy_ksq & 7)) : abs(rank - (enemy_ksq >> 4));
+                bonus_eg += 4 * (dist_enemy - dist_own);
             }
 
             {
@@ -951,8 +941,7 @@ int evaluate(void) {
                 }
             }
 
-            mg[color] += bonus_mg;
-            eg[color] += bonus_eg;
+            add_score(mg, eg, color, bonus_mg, bonus_eg);
         }
     }
     /* Rook activity: iterate pseudo_list -- only occupied squares, never
@@ -961,14 +950,12 @@ int evaluate(void) {
     for (i = 0; i < index; i++) {
         int sq = pseudo_list[i], p = board[sq];
         int pt = piece_type(p), color = piece_color(p), f = sq & 7;
-        if (pt == ROOK) {
-            // int rank = sq >> 4;
-            int bonus = 0;
-            if (pawn_cnt[color][f] == 0)
-                bonus += (pawn_cnt[color ^ 1][f] == 0) ? 20 : 10; /* open/semi-open file */
-            // no rook on 7th eval, piece/square tables will take care of that
-            mg[color] += bonus; eg[color] += bonus;
-        }
+            if (pt == ROOK) {
+                int bonus = 0;
+                if (pawn_cnt[color][f] == 0)
+                    bonus += (pawn_cnt[color ^ 1][f] == 0) ? 20 : 10; /* open/semi-open file */
+                add_score(mg, eg, color, bonus, bonus);
+            }
     }
 
     /* Tapered blend.
@@ -1186,31 +1173,31 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
        further back than ply - halfmove_clock. We step by 2 because
        repetitions require the same side to move. */
     if (ply > root_ply) {
-        /* Repetition detection */
-        for (int i = ply - 2; i >= root_ply; i -= 2)
-            if (history[i].hash_prev == hash_key) return 0;
-        {
-            int reps = 0;
-            for (int i = ply - 2; i >= 0 && i >= ply - halfmove_clock; i -= 2)
-                if (history[i].hash_prev == hash_key && ++reps >= 2) return 0;
-        }
+            /* Repetition detection */
+            for (int i = ply - 2; i >= root_ply; i -= 2)
+                if (history[i].hash_prev == hash_key) return 0;
+            {
+                int reps = 0;
+                for (int i = ply - 2; i >= 0 && i >= ply - halfmove_clock; i -= 2)
+                    if (history[i].hash_prev == hash_key && ++reps >= 2) return 0;
+            }
 
-        /* 50-move rule */
-        if (halfmove_clock >= 100) return 0;
+            /* 50-move rule */
+            if (halfmove_clock >= 100) return 0;
 
-        /* INSUFFICIENT MATERIAL
-            Only trigger when there is exactly one minor piece on the board total
-            (KNK or KBK). With one minor per side the corner-checkmate edge case
-            means we cannot safely claim a draw. */
-        {
-            int wminor = count[WHITE][KNIGHT] + count[WHITE][BISHOP];
-            int bminor = count[BLACK][KNIGHT] + count[BLACK][BISHOP];
-            if (wminor + bminor == 1
-                && count[WHITE][PAWN] == 0 && count[BLACK][PAWN] == 0
-                && count[WHITE][ROOK] == 0 && count[BLACK][ROOK] == 0
-                && count[WHITE][QUEEN] == 0 && count[BLACK][QUEEN] == 0)
-                return 0;
-        }
+            /* INSUFFICIENT MATERIAL
+               Only trigger when there is exactly one minor piece on the board total
+               (KNK or KBK). With one minor per side the corner-checkmate edge case
+               means we cannot safely claim a draw. */
+            {
+                int wminor = count[WHITE][KNIGHT] + count[WHITE][BISHOP];
+                int bminor = count[BLACK][KNIGHT] + count[BLACK][BISHOP];
+                if (wminor + bminor == 1
+                    && count[WHITE][PAWN] == 0 && count[BLACK][PAWN] == 0
+                    && count[WHITE][ROOK] == 0 && count[BLACK][ROOK] == 0
+                    && count[WHITE][QUEEN] == 0 && count[BLACK][QUEEN] == 0)
+                    return 0;
+            }
     }
 
     /* TT probe: always extract hash_move for ordering */
