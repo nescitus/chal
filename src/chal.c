@@ -790,38 +790,33 @@ static inline void add_score(int* mg, int* eg, int color, int mg_v, int eg_v) {
 int evaluate(void) {
     int mg[2], eg[2], phase;
     int lowest_pawn_rank[2][8];
-    int pseudo_list[32]; /* occupied squares built during first pass (Pawel Koziol) */
-    int index = 0, i;
 
-    /* Pawn square lists for passed-pawn detection.
-       At most 8 pawns per side; store 0x88 squares. */
-    int pawn_sq[2][8];
-    int pawn_sq_cnt[2];
+    /* Combined list of pawns and rooks -- the only pieces needing a second pass.
+       Pawns need full pawn structure info; rooks need open-file data.
+       All other pieces are fully scored in the first pass.                       */
+    int pr_list[32], pr_index = 0, i;
 
     mg[WHITE] = mg[BLACK] = eg[WHITE] = eg[BLACK] = phase = 0;
-    pawn_sq_cnt[WHITE] = pawn_sq_cnt[BLACK] = 0;
     for (int i = 0; i < 8; i++) {
         lowest_pawn_rank[WHITE][i] = 7;
         lowest_pawn_rank[BLACK][i] = 7;
     }
 
-    /* First pass: rank/file double loop visits exactly 64 valid squares
-       instead of 128 (Pawel: FOR_EACH_SQ loops the empty half too).
-       Occupied squares are recorded into pseudo_list as we go, so the
-       rook pass below never touches a single empty square.              */
+    /* First pass: material, PST, phase, mobility.
+       Pawns and rooks are also recorded into pr_list for the second pass. */
     for (int rank = 0; rank < 8; rank++) {
         for (int f = 0; f < 8; f++) {
             int sq = rank * 16 + f;
             int p = board[sq]; if (!p) continue;
-            pseudo_list[index++] = sq;                    /* memorize (Pawel) */
             int pt = piece_type(p), color = piece_color(p);
 
             if (pt == PAWN) {
                 int own_rank = (color == WHITE) ? rank : (7 - rank);
                 if (own_rank < lowest_pawn_rank[color][f])
                     lowest_pawn_rank[color][f] = own_rank;
-                if (pawn_sq_cnt[color] < 8)
-                    pawn_sq[color][pawn_sq_cnt[color]++] = sq;
+                pr_list[pr_index++] = sq;
+            } else if (pt == ROOK) {
+                pr_list[pr_index++] = sq;
             }
 
             /* Square index: rank 0 = White's back rank.
@@ -858,14 +853,12 @@ int evaluate(void) {
     for (int c = 0; c < 2; c++)
         if (count[c][BISHOP] >= 2) add_score(mg, eg, c, 31, 30);
 
-    /* Pawn structure and king safety (requires full pawn_cnt) */
-    for (int color = 0; color < 2; color++) {
-
-        /* King pawn shield -- MG only.
+    /* King pawn shield -- MG only.
            In the endgame, king centralisation is already rewarded by the
            EG king PST; a pawn shield is irrelevant and would only hurt. */
 
-        static const int shield_val[8] = { 0, 12, 4, -2, -2, 0, 0, -12 };
+    static const int shield_val[8] = { 0, 12, 4, -2, -2, 0, 0, -12 };
+    for (int color = 0; color < 2; color++) {
         int ksq = king_sq[color], kf = ksq & 7;
         if (kf <= 2 || kf >= 5) {
             int shield = 0;
@@ -880,83 +873,63 @@ int evaluate(void) {
         }
     }
 
-    /* DOUBLED, ISOLATED AND PASSED PAWNS
-       lowest_pawn_rank[color][file] stores the most backward pawn of that
-       color on that file, measured from that color's own side:
-         0 = home rank, 7 = no pawn on file.
-       To compare against our pawn's own_rank, the enemy value must be
-       inverted: enemy_front_rank = 7 - lowest_pawn_rank[enemy][file]. */
+    /* Second pass: iterate pr_list (pawns and rooks only).
+       Pawns: doubled, isolated, passed pawn scoring.
+       Rooks: open/semi-open file bonus.                  */
     static const int pp_eg[8] = { 0, 20, 30, 55, 80, 115, 170, 0 };
     static const int pp_mg[8] = { 0,  5, 10, 20, 35,  55,  80, 0 };
 
-    for (int color = 0; color < 2; color++) {
+    for (i = 0; i < pr_index; i++) {
+        int sq = pr_list[i], p = board[sq];
+        int pt = piece_type(p), color = piece_color(p), f = sq & 7;
+
+        if (pt == ROOK) {
+            int bonus = 0;
+            if (lowest_pawn_rank[color][f] == 7)
+                bonus += (lowest_pawn_rank[color ^ 1][f] == 7) ? 20 : 10; /* open/semi-open file */
+            add_score(mg, eg, color, bonus, bonus);
+            continue;
+        }
+
+        /* PAWN: doubled, isolated, passed */
+        int rank = sq >> 4;
+        int own_rank = (color == WHITE) ? rank : (7 - rank);
         int enemy = color ^ 1;
 
-        for (int pi = 0; pi < pawn_sq_cnt[color]; pi++) {
-            int sq = pawn_sq[color][pi];
-            int rank = sq >> 4;
-            int file = sq & 7;
-            int own_rank = (color == WHITE) ? rank : (7 - rank);
+        /* Doubled */
+        if (own_rank != lowest_pawn_rank[color][f])
+            add_score(mg, eg, color, -20, -20);
 
-            /* Doubled, tripled etc pawns */
-            if (own_rank != lowest_pawn_rank[color][file])
-                add_score(mg, eg, color, -20, -20);
+        /* Passed and isolated detection */
+        int passed = 1, isolated = 1;
+        for (int df = -1; df <= 1; df++) {
+            int ef = f + df;
+            if (ef < 0 || ef > 7) continue;
 
-            /* Detect whether a pawn is passed and/or isolated */
-            int passed = 1;
-            int isolated = 1;
-
-            for (int df = -1; df <= 1; df++) {
-                int ef = file + df;
-                if (ef < 0 || ef > 7) continue;
-
-                /* Passed-pawn test: enemy pawn ahead on same/adjacent file */
-                if (lowest_pawn_rank[enemy][ef] != 7) {
-                    int enemy_front_rank = 7 - lowest_pawn_rank[enemy][ef];
-                    if (enemy_front_rank >= own_rank)
-                        passed = 0;
-                }
-
-                /* Isolated-pawn test: any friendly pawn on adjacent file cancels isolation */
-                if (df != 0 && lowest_pawn_rank[color][ef] != 7)
-                    isolated = 0;
+            /* Passed-pawn test: enemy pawn ahead on same/adjacent file */
+            if (lowest_pawn_rank[enemy][ef] != 7) {
+                int enemy_front_rank = 7 - lowest_pawn_rank[enemy][ef];
+                if (enemy_front_rank >= own_rank) passed = 0;
             }
-
-            if (isolated) add_score(mg, eg, color, -10, -10);
-                
-            if (!passed) continue;
-
-            /* Calculate passed pawn bonus (midgame - straingh form the table,
-               endgame - enhanced by evaluating distance to both kings */
-            int bonus_mg = pp_mg[own_rank];
-            int bonus_eg = pp_eg[own_rank];
-            bonus_eg += 4 * (distance(sq, king_sq[enemy]) - distance(sq, king_sq[color]));
-
-            /* Decrease bonus for blocked passers */
-            int front = sq + (color == WHITE ? 16 : -16);
-            if (!sq_is_off(front) && board[front] && piece_color(board[front]) == enemy) {
-                bonus_mg /= 2;
-                bonus_eg /= 2;
-            }
-            
-
-            add_score(mg, eg, color, bonus_mg, bonus_eg);
+            /* Isolated-pawn test: any friendly pawn on adjacent file cancels isolation */
+            if (df != 0 && lowest_pawn_rank[color][ef] != 7) isolated = 0;
         }
-    }
 
+        if (isolated) add_score(mg, eg, color, -10, -10);
+        if (!passed) continue;
 
-    /* Rook activity: iterate pseudo_list -- only occupied squares, never
-       the 32+ empty squares FOR_EACH_SQ would visit (Pawel Koziol).
-       Applied to both MG and EG: an open rook is valuable in all phases. */
-    for (i = 0; i < index; i++) {
-        int sq = pseudo_list[i], p = board[sq];
-        int pt = piece_type(p), color = piece_color(p), f = sq & 7;
-            if (pt == ROOK) {
-                int bonus = 0;
-                if (lowest_pawn_rank[color][f] == 7)
-                    bonus += (lowest_pawn_rank[color ^ 1][f] == 7) ? 20 : 10; /* open/semi-open file */
-                add_score(mg, eg, color, bonus, bonus);
-            }
+        /* Calculate passed pawn bonus (midgame - straingh form the table,
+           endgame - enhanced by evaluating distance to both kings */
+        int bonus_mg = pp_mg[own_rank];
+        int bonus_eg = pp_eg[own_rank];
+        bonus_eg += 4 * (distance(sq, king_sq[enemy]) - distance(sq, king_sq[color]));
+
+        /* Decrease bonus for blocked passers */
+        int front = sq + (color == WHITE ? 16 : -16);
+        if (!sq_is_off(front) && board[front] && piece_color(board[front]) == enemy) {
+            bonus_mg /= 2; bonus_eg /= 2;
+        }
+        add_score(mg, eg, color, bonus_mg, bonus_eg);
     }
 
     /* Tapered blend.
@@ -1731,7 +1704,7 @@ void uci_loop(void) {
 /* ===============================================================
    ENTRY POINT
    =============================================================== */
-
+    
 int main(void) {
     setbuf(stdout, NULL);
     uci_loop();
