@@ -1052,7 +1052,7 @@ static void init_lmr(void) {
     for (d = 0; d < 32; d++)
         for (m = 0; m < 64; m++) {
             if (d < 3 || m < 4) { lmr_table[d][m] = 0; continue; }
-            double r = log((double)d) * log((double)m) / 1.6;
+            double r = log((double)d) * log((double)m) / 1.8;
             int ri = (int)(r + 0.5);   /* round */
             lmr_table[d][m] = ri < 1 ? 1 : ri > 5 ? 5 : ri;
         }
@@ -1207,14 +1207,17 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
 
     nodes_searched++;
 
-    /* REVERSE FUTILITY PRUNING (RFP / Static Null Move Pruning)
-       static_eval is computed once and reused; no second evaluate() call. */
-    if (!caps_only && depth >= 1 && depth <= 7
-        && beta < MATE - MAX_PLY
-        && !in_check(side)) {
+    /* REVERSE FUTILITY PRUNING (RFP) and RAZORING -- both use static eval,
+       so we compute it once and apply both tests. */
+    if (!caps_only && depth <= 7 && beta < MATE - MAX_PLY && !in_check(side)) {
         int static_eval = evaluate();
-        if (static_eval - 70 * depth >= beta)
+        /* RFP: if eval beats beta by a margin, prune immediately. */
+        if (depth >= 1 && static_eval - 70 * depth >= beta)
             return static_eval - 70 * depth;
+        /* RAZORING: if eval is far below alpha even accounting for captures,
+           drop into quiescence search rather than searching full depth. */
+        if (!is_pv && depth <= 3 && static_eval + 300 + 60 * depth < alpha)
+            return search(0, alpha, beta, 0, sply);
     }
 
     /* NULL MOVE PRUNING (NMP)
@@ -1704,7 +1707,7 @@ void uci_loop(void) {
 /* ===============================================================
    ENTRY POINT
    =============================================================== */
-    
+
 int main(void) {
     setbuf(stdout, NULL);
     uci_loop();
