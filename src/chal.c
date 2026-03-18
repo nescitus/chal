@@ -1187,8 +1187,8 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
             if (tt_sc > MATE - MAX_PLY) tt_sc -= sply;
             if (tt_sc < -(MATE - MAX_PLY)) tt_sc += sply;
             if (sply > 0) {
-                if (flag == TT_EXACT)                           return tt_sc;
-                if (!is_pv && flag == TT_BETA && tt_sc >= beta) return tt_sc;
+                if (flag == TT_EXACT)                            return tt_sc;
+                if (!is_pv && flag == TT_BETA  && tt_sc >= beta) return tt_sc;
                 if (!is_pv && flag == TT_ALPHA && tt_sc <= alpha) return tt_sc;
             }
         }
@@ -1392,7 +1392,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         return in_check(side) ? -(MATE - sply) : 0;
 
     /* TT store: skip if search was aborted mid-tree (score is meaningless) */
-    if (!time_over_flag && best && (e->key != hash_key || depth >= (int)tt_depth(e))) {
+    if (!time_over_flag && (e->key != hash_key || depth >= (int)tt_depth(e))) {
         int flag = (best_sc <= old_alpha) ? TT_ALPHA :
             (best_sc >= beta) ? TT_BETA : TT_EXACT;
         /* Encode mate scores as distance-from-node (+sply) so the score
@@ -1400,7 +1400,10 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         int sc_store = best_sc;
         if (sc_store > MATE - MAX_PLY) sc_store += sply;
         if (sc_store < -(MATE - MAX_PLY)) sc_store -= sply;
-        e->key = hash_key; e->score = sc_store; e->best_move = best;
+        /* For fail-low nodes, preserve the hash move from the probe for
+           ordering on the next visit even if no move raised alpha. */
+        Move store_move = best ? best : hash_move;
+        e->key = hash_key; e->score = sc_store; e->best_move = store_move;
         e->depth_flag = tt_pack(depth > 0 ? depth : 0, flag);
     }
     return best_sc;
@@ -1447,7 +1450,7 @@ void search_root(int max_depth) {
            score from depth 5 onward. */
         if (root_depth >= 5) {
             alpha = prev_score - 50;
-            beta = prev_score + 50;
+            beta  = prev_score + 50;
         }
 
         sc = search(root_depth, alpha, beta, 0, 0);
