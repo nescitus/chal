@@ -142,7 +142,7 @@ static inline unsigned int tt_pack(int d, int f) { return (unsigned int)((d << 2
 */
 
 typedef struct {
-    Move move; int piece_captured; int ep_square_prev; unsigned int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev;
+    Move move; int piece_captured; int capt_slot;  int ep_square_prev; unsigned int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev;
 } State;
 
 State history[1024];
@@ -237,6 +237,68 @@ int64_t time_budget_ms;
    (where a single prior occurrence is sufficient to claim draw) from
    game-history positions (which require two prior occurrences).     */
 int root_ply;
+
+/* ---------------------------------------------------------------
+   PIECE LIST
+   ---------------------------------------------------------------
+   Idea
+   Iterating the full 128-square board to find pieces is wasteful
+   since at most 32 squares are ever occupied. A compact piece list
+   lets the evaluator and other routines visit only live pieces.
+
+   Implementation
+   Two parallel arrays (list_piece[], list_square[]) hold piece type
+   and square for each of the up to 32 pieces. White occupies slots
+   0-15 and Black occupies slots 16-31. list_index[sq] maps a board
+   square back to its slot in O(1), enabling fast removal on captures.
+   list_count[color] tracks how many pieces each side has.
+
+   set_list() rebuilds the list from scratch (called after parse_fen).
+   make_move / undo_move update the list incrementally via list_index.
+*/
+
+enum { LIST_OFF = 0x88 };
+
+int list_piece[32];
+int list_square[32];
+int list_index[128];
+int list_count[2];
+static inline int list_slot_color(int i) { return (i < 16) ? WHITE : BLACK; }
+
+static void clear_list(void) {
+    for (int i = 0; i < 32; i++) {
+        list_piece[i] = EMPTY;
+        list_square[i] = LIST_OFF;
+    }
+    for (int sq = 0; sq < 128; sq++) {
+        list_index[sq] = -1;
+    }
+    list_count[WHITE] = 0;
+    list_count[BLACK] = 0;
+}
+
+static void set_list(void) {
+    int pt, sq;
+
+    clear_list();
+
+    for (pt = PAWN; pt <= KING; pt++) {
+        FOR_EACH_SQ(sq) {
+            int p = board[sq];
+            if (!p) continue;
+            if (piece_type(p) != pt) continue;
+
+            {
+                int color = piece_color(p);
+                int slot = (color == WHITE ? 0 : 16) + list_count[color]++;
+
+                list_piece[slot] = pt;
+                list_square[slot] = sq;
+                list_index[sq] = slot;
+            }
+        }
+    }
+}
 
 /* ===============================================================
    S3  DIRECTION & CASTLING DATA
@@ -427,17 +489,38 @@ void make_move(Move m) {
     history[ply].castle_rights_prev = castle_rights; history[ply].halfmove_clock_prev = halfmove_clock; history[ply].hash_prev = hash_key;
     halfmove_clock = (pt == PAWN || cap) ? 0 : halfmove_clock + 1;
 
+    history[ply].capt_slot = -1;
+
     if (pt == PAWN && t == ep_square) {
         int ep_pawn = t + (side == WHITE ? -16 : 16);
-        history[ply].piece_captured = board[ep_pawn]; board[ep_pawn] = EMPTY;
+
+        history[ply].piece_captured = board[ep_pawn];
+        history[ply].capt_slot = list_index[ep_pawn];
+
+        list_square[history[ply].capt_slot] = LIST_OFF; list_index[ep_pawn] = -1;
+
+        board[ep_pawn] = EMPTY;
         toggle(xside, PAWN, ep_pawn);
         count[xside][PAWN]--;
     }
+
+
+    if (cap) {
+        history[ply].capt_slot = list_index[t];
+        int cap_slot = list_index[t];
+        list_square[cap_slot] = LIST_OFF;
+        list_index[t] = -1;
+    }
+
+    int move_slot = list_index[f];
+    list_square[move_slot] = t; list_index[t] = move_slot; list_index[f] = -1;
+
     board[t] = p; board[f] = EMPTY;
     toggle(side, pt, f); toggle(side, pt, t);
     if (cap) { toggle(xside, piece_type(cap), t); count[xside][piece_type(cap)]--; }
 
     if (pr) {
+        int slot = list_index[t]; list_piece[slot] = pr;
         board[t] = make_piece(side, pr); toggle(side, pt, t); toggle(side, pr, t);
         count[side][PAWN]--; count[side][pr]++;
     } /* pawn promoted to piece */
@@ -447,8 +530,13 @@ void make_move(Move m) {
         king_sq[side] = t;
         for (int ci = 0; ci < 4; ci++) {
             if (f == castle_kf[ci] && t == castle_kt[ci]) {
-                board[castle_rf[ci]] = EMPTY; board[castle_rt[ci]] = make_piece(castle_col[ci], ROOK);
-                toggle(castle_col[ci], ROOK, castle_rf[ci]); toggle(castle_col[ci], ROOK, castle_rt[ci]);
+                int rook_from = castle_rf[ci]; int rook_to = castle_rt[ci]; int rook_slot = list_index[rook_from];
+
+                board[rook_from] = EMPTY; board[rook_to] = make_piece(castle_col[ci], ROOK);
+
+                list_square[rook_slot] = rook_to; list_index[rook_to] = rook_slot; list_index[rook_from] = -1;
+
+                toggle(castle_col[ci], ROOK, rook_from);  toggle(castle_col[ci], ROOK, rook_to);
                 break;
             }
         }
@@ -467,28 +555,59 @@ void make_move(Move m) {
 void undo_move(void) {
     ply--; side ^= 1; xside ^= 1;
     Move m = history[ply].move; int f = move_from(m), t = move_to(m), pr = move_promo(m);
+
     int cap = history[ply].piece_captured;
-    board[f] = board[t]; board[t] = cap;
-    if (pr) { board[f] = make_piece(side, PAWN); count[side][pr]--; count[side][PAWN]++; }
+
+    /* move the moving piece back: t -> f */
+    
+    int move_slot = list_index[t];
+    list_square[move_slot] = f; list_index[f] = move_slot; list_index[t] = -1;
+    
+    board[f] = board[t];
+    board[t] = cap;
+    if (pr) {
+        int slot = list_index[f]; list_piece[slot] = PAWN;
+        board[f] = make_piece(side, PAWN); count[side][pr]--; count[side][PAWN]++;
+    }
     int pt = piece_type(board[f]);
 
     if (pt == PAWN && t == history[ply].ep_square_prev) {
-        board[t] = EMPTY; board[t + (side == WHITE ? -16 : 16)] = cap;
+        int ep_pawn = t + (side == WHITE ? -16 : 16);
+
+        board[t] = EMPTY;
+        board[ep_pawn] = cap;
+
+        if (cap) {
+            int cap_slot = history[ply].capt_slot;
+            list_square[cap_slot] = ep_pawn; list_index[ep_pawn] = cap_slot;
+        }
+
         count[xside][PAWN]++;
     } else if (cap) {
+        int cap_slot = history[ply].capt_slot;
+        list_square[cap_slot] = t;
+        list_index[t] = cap_slot;
+
         count[xside][piece_type(cap)]++;
     }
+
     if (pt == KING) {
         king_sq[side] = f;
         for (int ci = 0; ci < 4; ci++) {
             if (f == castle_kf[ci] && t == castle_kt[ci]) {
-                board[castle_rt[ci]] = EMPTY; board[castle_rf[ci]] = make_piece(castle_col[ci], ROOK); break;
+                int rook_from = castle_rt[ci]; int rook_to = castle_rf[ci]; int rook_slot = list_index[rook_from];
+
+                board[rook_from] = EMPTY;
+                board[rook_to] = make_piece(castle_col[ci], ROOK);
+
+                list_square[rook_slot] = rook_to; list_index[rook_to] = rook_slot; list_index[rook_from] = -1;
+                break;
             }
         }
     }
     ep_square = history[ply].ep_square_prev; castle_rights = history[ply].castle_rights_prev;
     halfmove_clock = history[ply].halfmove_clock_prev;
-    hash_key = history[ply].hash_prev; /* O(1) restore */
+    hash_key = history[ply].hash_prev;
 }
 
 /* ===============================================================
@@ -518,10 +637,12 @@ int generate_moves(Move* moves, int caps_only) {
     int pawn_start = (side == WHITE) ? 1 : 6;
     int pawn_promo = (side == WHITE) ? 6 : 1;
 
-    FOR_EACH_SQ(sq) {
+    for (int slot = (side == WHITE ? 0 : 16); slot < (side == WHITE ? 16 : 32); slot++) {
+        int sq = list_square[slot];
+        if (sq == LIST_OFF) continue;
+
         int p = board[sq];
-        if (!p || piece_color(p) != side) continue;
-        int pt = piece_type(p);
+        int pt = list_piece[slot];
 
         /* -- Pawns ------------------------------------------------ */
         if (pt == PAWN) {
@@ -660,6 +781,8 @@ void parse_fen(const char* fen) {
     while (*fen && *fen != ' ') fen++;
     halfmove_clock = 0;
     if (*fen == ' ') { fen++; halfmove_clock = atoi(fen); }
+
+    set_list();
 }
 
 /* ===============================================================
@@ -802,50 +925,54 @@ int evaluate(void) {
         lowest_pawn_rank[BLACK][i] = 7;
     }
 
+    // info depth 20 score cp 28 nodes 32441690 time 68010 pv e2e4 e7e5 g1f3 b8c6 d2d4 e5d4 f3d4 c6d4 d1d4 g8e7 c1e3 e7c6 d4d2 f8d6 b1c3 e8g8 e1c1 a7a6 f1c4 f8e8
+    // info depth 20 score cp 28 nodes 32441690 time 62949 pv e2e4 e7e5 g1f3 b8c6 d2d4 e5d4 f3d4 c6d4 d1d4 g8e7 c1e3 e7c6 d4d2 f8d6 b1c3 e8g8 e1c1 a7a6 f1c4 f8e8
+    // !!!
+
     /* First pass: material, PST, phase, mobility.
        Pawns and rooks are also recorded into pr_list for the second pass. */
-    for (int rank = 0; rank < 8; rank++) {
-        for (int f = 0; f < 8; f++) {
-            int sq = rank * 16 + f;
-            int p = board[sq]; if (!p) continue;
-            int pt = piece_type(p), color = piece_color(p);
+    for (int slot = 0; slot < 32; slot++) {
+        int sq = list_square[slot];
+        if (sq == LIST_OFF) continue;
 
-            if (pt == PAWN) {
-                int own_rank = (color == WHITE) ? rank : (7 - rank);
-                if (own_rank < lowest_pawn_rank[color][f])
-                    lowest_pawn_rank[color][f] = own_rank;
-                pr_list[pr_index++] = sq;
-            } else if (pt == ROOK) {
-                pr_list[pr_index++] = sq;
-            }
+        int pt = list_piece[slot], color = list_slot_color(slot);
+        int rank = sq >> 4, f = sq & 7;
 
-            /* Square index: rank 0 = White's back rank.
-               Black mirrors vertically so its rank 0 is rank 7 in White terms. */
-            int idx = (color == WHITE) ? rank * 8 + f : (7 - rank) * 8 + f;
+        if (pt == PAWN) {
+            int own_rank = (color == WHITE) ? rank : (7 - rank);
+            if (own_rank < lowest_pawn_rank[color][f])
+                lowest_pawn_rank[color][f] = own_rank;
+            pr_list[pr_index++] = sq;
+        } else if (pt == ROOK) {
+            pr_list[pr_index++] = sq;
+        }
 
-            /* Material + PST: scored into MG and EG accumulators separately.
-               pt-1 converts TYPE() (1-based) to the 0-based table index. */
-            add_score(mg, eg, color, mg_val[pt - 1] + mg_pst[pt - 1][idx], eg_val[pt - 1] + eg_pst[pt - 1][idx]);
-            phase += phase_inc[pt];
+        /* Square index: rank 0 = White's back rank.
+           Black mirrors vertically so its rank 0 is rank 7 in White terms. */
+        int idx = (color == WHITE) ? rank * 8 + f : (7 - rank) * 8 + f;
 
-            /* Mobility: count pseudo-legal reachable squares, centered so that
-               a piece with exactly mob_center[pt] squares scores zero.
-               Pinned pieces appear more mobile than they are, but the
-               approximation is cheap and consistently directional. */
-            if (pt >= KNIGHT && pt <= QUEEN) {
-                int mob = 0;
-                for (i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
-                    int step = step_dir[i], target = sq + step;
-                    while (!sq_is_off(target)) {
-                        if (board[target] == 0) { mob++; }
-                        else { if (piece_color(board[target]) != color) mob++; break; }
-                        if (pt == KNIGHT) break;
-                        target += step;
-                    }
+        /* Material + PST: scored into MG and EG accumulators separately.
+           pt-1 converts TYPE() (1-based) to the 0-based table index. */
+        add_score(mg, eg, color, mg_val[pt - 1] + mg_pst[pt - 1][idx], eg_val[pt - 1] + eg_pst[pt - 1][idx]);
+        phase += phase_inc[pt];
+
+        /* Mobility: count pseudo-legal reachable squares, centered so that
+           a piece with exactly mob_center[pt] squares scores zero.
+           Pinned pieces appear more mobile than they are, but the
+           approximation is cheap and consistently directional. */
+        if (pt >= KNIGHT && pt <= QUEEN) {
+            int mob = 0;
+            for (i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
+                int step = step_dir[i], target = sq + step;
+                while (!sq_is_off(target)) {
+                    if (board[target] == 0) { mob++; }
+                    else { if (piece_color(board[target]) != color) mob++; break; }
+                    if (pt == KNIGHT) break;
+                    target += step;
                 }
-                mob -= mob_center[pt];
-                add_score(mg, eg, color, mob_step_mg[pt] * mob, mob_step_eg[pt] * mob);
             }
+            mob -= mob_center[pt];
+            add_score(mg, eg, color, mob_step_mg[pt] * mob, mob_step_eg[pt] * mob);
         }
     }
 
