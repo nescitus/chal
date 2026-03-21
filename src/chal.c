@@ -1419,7 +1419,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
             }
         }
         if (alpha >= beta) {
-            if (!board[move_to(moves[i])]) {   /* quiet cutoff move */
+            if (!is_cap && !move_promo(moves[i])) {   /* quiet cutoff move */
                 int d = (sply < MAX_PLY) ? sply : MAX_PLY - 1;
                 int bonus = depth * depth;
                 killers[d][1] = killers[d][0]; killers[d][0] = moves[i];
