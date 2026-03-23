@@ -1017,7 +1017,19 @@ int evaluate(void) {
     if (phase > 24) phase = 24;
     int mg_score = mg[side] - mg[side ^ 1];
     int eg_score = eg[side] - eg[side ^ 1];
-    return (mg_score * phase + eg_score * (24 - phase)) / 24;
+    int score = (mg_score * phase + eg_score * (24 - phase)) / 24;
+
+    /* DRAWISH ENDGAME SCALING -- disabled, retest at 2600+ Elo
+    int winner = (score > 0) ? side : (side ^ 1);
+    if (count[winner][PAWN] == 0
+        && count[winner][QUEEN] + count[winner][ROOK] < 2
+        && count[winner][KNIGHT] + count[winner][BISHOP] < 3) {
+        int bal = 3 * (count[winner][KNIGHT] + count[winner][BISHOP] - count[winner^1][KNIGHT] - count[winner^1][BISHOP])
+                + 5 * (count[winner][ROOK]   - count[winner^1][ROOK])
+                + 9 * (count[winner][QUEEN]  - count[winner^1][QUEEN]);
+        if (bal < 5) score /= 3;
+    } */
+    return score;
 }
 
 /* ===============================================================
@@ -1331,6 +1343,20 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
             if (dp_cap || dp_ep) {
                 int cap_val = dp_cap ? piece_val[piece_type(dp_cap)] : piece_val[PAWN];
                 if (best_sc + cap_val + 200 < alpha) continue;
+            }
+
+            /* PAWN-DEFENDED PAWN PRUNING (Quiescence only)
+               Skip captures of a pawn that is defended by another pawn --
+               a non-pawn piece taking a pawn guarded by a pawn is almost
+               always losing material. More expensive than delta pruning so
+               placed after it. */
+            if (dp_cap && piece_type(dp_cap) == PAWN
+                && piece_type(board[move_from(moves[i])]) != PAWN) {
+                int to = move_to(moves[i]);
+                int pdir = (xside == WHITE) ? -16 : 16; /* direction xside pawns attack from */
+                if ((!sq_is_off(to + pdir - 1) && board[to + pdir - 1] == make_piece(xside, PAWN)) ||
+                    (!sq_is_off(to + pdir + 1) && board[to + pdir + 1] == make_piece(xside, PAWN)))
+                    continue;
             }
         }
 
