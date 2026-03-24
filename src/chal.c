@@ -1321,12 +1321,19 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         if (sc >= beta) return sc;  /* fail-soft: return actual score, not beta */
     }
 
+    /* INTERNAL ITERATIVE REDUCTIONS (IIR)
+       Without a TT move to guide ordering, deep searches are unreliable.
+       Reduce depth by 1 -- the resulting TT entry will improve ordering
+       on the next iteration at the cost of one cheap extra search.       */
+    if (!caps_only && depth >= 4 && !hash_move && !in_check(side)) depth--;
+
     int cnt = generate_moves(moves, caps_only);
     int scores[256];
     score_moves(moves, scores, cnt, hash_move, sply);
     /* Track quiet moves in order so the malus loop has an explicit list
        (avoids re-checking board[] state after moves are undone). */
     Move quiet_moves[256]; int nquiet = 0;
+    int node_in_check = !caps_only && in_check(side); /* cached once -- board unchanged until make_move */
 
     for (int i = 0; i < cnt; i++) {
         pick_move(moves, scores, cnt, i);
@@ -1366,6 +1373,14 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         int is_cap = board[move_to(moves[i])] != 0
             || (piece_type(board[move_from(moves[i])]) == PAWN
                 && move_to(moves[i]) == ep_square);
+        /* HISTORY PRUNING: skip quiet moves with very negative history at
+           shallow depths.  Done before make_move to avoid the undo cost.
+           Guarded by node_in_check: when we are in check, every quiet move
+           may be the only legal defence, so we must not prune any of them. */
+        if (!caps_only && !is_pv && !node_in_check && depth <= 4
+            && !is_cap && !move_promo(moves[i])
+            && hist[move_from(moves[i])][move_to(moves[i])] < -1024 * depth)
+            continue;
         make_move(moves[i]);
         if (is_illegal()) { undo_move(); continue; }
         legal++;
