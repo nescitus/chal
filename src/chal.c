@@ -1054,18 +1054,41 @@ int evaluate(void) {
       of the ordering without ever skipping them entirely.
 */
 
+static inline int pawn_defended_by_pawn(int s) {
+    int p = board[s];
+    if (!p || piece_type(p) != PAWN) return 0;
+
+    int c = piece_color(p);
+    int att_sq1 = s + (c == WHITE ? -17 : 15);
+    int att_sq2 = s + (c == WHITE ? -15 : 17);
+
+    return (!sq_is_off(att_sq1) && board[att_sq1] == make_piece(c, PAWN)) ||
+           (!sq_is_off(att_sq2) && board[att_sq2] == make_piece(c, PAWN));
+}
+
 static inline int score_move(Move m, Move hash_move, int sply) {
     int cap, sc = 0;
     if (m == hash_move) return 30000;
+
+    int from = move_from(m); int to = move_to(m);
     cap = board[move_to(m)];
+
     /* EP captures land on an empty square; treat them as pawn captures for ordering. */
     if (!cap && piece_type(board[move_from(m)]) == PAWN && move_to(m) == ep_square)
         cap = make_piece(xside, PAWN);
-    if (cap)                sc = 20000 + 10 * piece_val[piece_type(cap)] - piece_val[piece_type(board[move_from(m)])];
+     
+    if (cap) {
+        int hunter_type = piece_type(board[from]); int prey_type = piece_type(cap);
+
+        if (prey_type == PAWN && hunter_type != PAWN && pawn_defended_by_pawn(to))
+            sc = -17000 + 10 * piece_val[prey_type] - piece_val[hunter_type];
+        else
+            sc = 20000 + 10 * piece_val[prey_type] - piece_val[hunter_type];
+    }
     else if (move_promo(m)) sc = 19999;
     else if (sply < MAX_PLY && m == killers[sply][0]) sc = 19998;
     else if (sply < MAX_PLY && m == killers[sply][1]) sc = 19997;
-    else                    sc = hist[move_from(m)][move_to(m)];  /* [-16000, 16000] */
+    else                    sc = hist[from][to];  /* [-16000, 16000] */
     return sc;
 }
 
@@ -1357,12 +1380,8 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
                a non-pawn piece taking a pawn guarded by a pawn is almost
                always losing material. More expensive than delta pruning so
                placed after it. */
-            if (dp_cap && piece_type(dp_cap) == PAWN
-                && piece_type(board[move_from(moves[i])]) != PAWN) {
-                int to = move_to(moves[i]);
-                int pdir = (xside == WHITE) ? -16 : 16; /* direction xside pawns attack from */
-                if ((!sq_is_off(to + pdir - 1) && board[to + pdir - 1] == make_piece(xside, PAWN)) ||
-                    (!sq_is_off(to + pdir + 1) && board[to + pdir + 1] == make_piece(xside, PAWN)))
+            if (dp_cap && piece_type(board[move_from(moves[i])]) != PAWN) {
+                if (pawn_defended_by_pawn(move_to(moves[i])))
                     continue;
             }
         }
@@ -1680,7 +1699,7 @@ void uci_loop(void) {
             hash_key = generate_hash();
         }
         else if (!strncmp(line, "uci", 3)) {
-            printf("id name Chal root\nid author Naman Thanki\n");
+            printf("id name Chal 1\nid author Naman Thanki\n");
             printf("option name Hash type spin default 16 min 1 max 4096\n");
             printf("uciok\n");
             fflush(stdout);
