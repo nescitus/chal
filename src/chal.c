@@ -301,6 +301,8 @@ static inline int color_on(int sq)  { return piece_color(board[sq]); }
 static inline int ptype_on(int sq)  { return piece_type(board[sq]); }
 static inline int king_sq(int color) { return list_square[(color == WHITE ? 0 : 16) + list_count[color] - 1]; }
 static inline int list_slot_color(int i) { return (i < 16) ? WHITE : BLACK; }
+static inline void list_set_sq(int slot, int sq) { list_square[slot] = sq; list_index[sq] = slot; }
+static inline void list_remove(int slot, int sq) { list_square[slot] = LIST_OFF; list_index[sq] = -1; }
 
 static void set_list(void) {
     int pt, sq;
@@ -495,13 +497,17 @@ static void add_promo(Move* list, int* n, int fr, int to) {
 static inline void toggle(int c, int p, int sq) { hash_key ^= zobrist_piece[c][p][sq]; }
 
 void make_move(Move m) {
+
+    /* Setting the variables */
     int fr = move_from(m), to = move_to(m), pr = move_promo(m), p = piece_on(fr), pt = piece_type(p), cap = piece_on(to);
+
+    /* Saving move data for unmaking */
     history[ply].move = m; history[ply].piece_captured = cap; history[ply].ep_square_prev = ep_square;
     history[ply].castle_rights_prev = castle_rights; history[ply].halfmove_clock_prev = halfmove_clock; history[ply].hash_prev = hash_key;
     halfmove_clock = (pt == PAWN || cap) ? 0 : halfmove_clock + 1;
-
     history[ply].capt_slot = -1;
 
+    /* En passant capture */
     if (pt == PAWN && to == ep_square) {
         int ep_pawn = to + (side == WHITE ? -16 : 16);
         history[ply].piece_captured = piece_on(ep_pawn);
@@ -512,36 +518,33 @@ void make_move(Move m) {
         count[xside][PAWN]--;
     }
 
-
+    /* Normal capture */
     if (cap) {
         history[ply].capt_slot = list_index[to];
-        int cap_slot = list_index[to];
-        list_square[cap_slot] = LIST_OFF; list_index[to] = -1;
+        list_remove(list_index[to], to);
+        toggle(xside, piece_type(cap), to); count[xside][piece_type(cap)]--;
     }
 
-    int move_slot = list_index[fr];
-    list_square[move_slot] = to; list_index[to] = move_slot; list_index[fr] = -1;
-
+    /* Move piece */
+    list_set_sq(list_index[fr], to); list_index[fr] = -1;
     board[to] = p; board[fr] = EMPTY;
     toggle(side, pt, fr); toggle(side, pt, to);
-    if (cap) { toggle(xside, piece_type(cap), to); count[xside][piece_type(cap)]--; }
 
+    /* Promotion */
     if (pr) {
         int slot = list_index[to]; list_piece[slot] = pr;
         board[to] = make_piece(side, pr); toggle(side, pt, to); toggle(side, pr, to);
         count[side][PAWN]--; count[side][pr]++;
-    } /* pawn promoted to piece */
+    }
 
+    /* Castling */
     hash_key ^= zobrist_castle[castle_rights];
     if (pt == KING) {
         for (int ci = 0; ci < 4; ci++) {
             if (fr == castle_kf[ci] && to == castle_kt[ci]) {
                 int rook_from = castle_rf[ci]; int rook_to = castle_rt[ci]; int rook_slot = list_index[rook_from];
-
                 board[rook_from] = EMPTY; board[rook_to] = make_piece(castle_col[ci], ROOK);
-
-                list_square[rook_slot] = rook_to; list_index[rook_to] = rook_slot; list_index[rook_from] = -1;
-
+                list_set_sq(rook_slot, rook_to); list_index[rook_from] = -1;
                 toggle(castle_col[ci], ROOK, rook_from);  toggle(castle_col[ci], ROOK, rook_to);
                 break;
             }
@@ -551,62 +554,58 @@ void make_move(Move m) {
     for (int ci = 0; ci < 4; ci++) if (fr == cr_sq[ci] || to == cr_sq[ci]) castle_rights &= cr_mask[ci]; /* Strip castling */
     hash_key ^= zobrist_castle[castle_rights];
 
+    /* Setting en passant square */
     if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
     ep_square = SQ_NONE;
     if (pt == PAWN && ((to - fr) == 32 || (fr - to) == 32)) { ep_square = fr + (side == WHITE ? 16 : -16); hash_key ^= zobrist_ep[ep_square]; }
 
+    /* Changing side to move */
     hash_key ^= zobrist_side; side ^= 1; xside ^= 1; ply++;
 }
 
 void undo_move(void) {
     ply--; side ^= 1; xside ^= 1;
     Move m = history[ply].move; int fr = move_from(m), to = move_to(m), pr = move_promo(m);
-
     int cap = history[ply].piece_captured;
 
-    /* move the moving piece back: t -> f */
-
-    int move_slot = list_index[to];
-    list_square[move_slot] = fr; list_index[fr] = move_slot; list_index[to] = -1;
-
+    /* Move piece back: to -> fr */
+    list_set_sq(list_index[to], fr); list_index[to] = -1;
     board[fr] = board[to];
     board[to] = cap;
+
+    /* Undo promotion */
     if (pr) {
         int slot = list_index[fr]; list_piece[slot] = PAWN;
         board[fr] = make_piece(side, PAWN); count[side][pr]--; count[side][PAWN]++;
     }
     int pt = ptype_on(fr);
 
+    /* Undo en passant */
     if (pt == PAWN && to == history[ply].ep_square_prev) {
         int ep_pawn = to + (side == WHITE ? -16 : 16);
-
         board[to] = EMPTY;
         board[ep_pawn] = cap;
-
-        if (cap) {
-            int cap_slot = history[ply].capt_slot;
-            list_square[cap_slot] = ep_pawn; list_index[ep_pawn] = cap_slot;
-        }
-
+        if (cap) list_set_sq(history[ply].capt_slot, ep_pawn);
         count[xside][PAWN]++;
+    /* Undo normal capture */
     } else if (cap) {
-        int cap_slot = history[ply].capt_slot;
-        list_square[cap_slot] = to;
-        list_index[to] = cap_slot;
+        list_set_sq(history[ply].capt_slot, to);
         count[xside][piece_type(cap)]++;
     }
 
+    /* Undo castling */
     if (pt == KING) {
         for (int ci = 0; ci < 4; ci++) {
             if (fr == castle_kf[ci] && to == castle_kt[ci]) {
                 int rook_from = castle_rt[ci]; int rook_to = castle_rf[ci]; int rook_slot = list_index[rook_from];
-                board[rook_from] = EMPTY;
-                board[rook_to] = make_piece(castle_col[ci], ROOK);
-                list_square[rook_slot] = rook_to; list_index[rook_to] = rook_slot; list_index[rook_from] = -1;
+                board[rook_from] = EMPTY; board[rook_to] = make_piece(castle_col[ci], ROOK);
+                list_set_sq(rook_slot, rook_to); list_index[rook_from] = -1;
                 break;
             }
         }
     }
+
+    /* Restore irreversible state */
     ep_square = history[ply].ep_square_prev; castle_rights = history[ply].castle_rights_prev;
     halfmove_clock = history[ply].halfmove_clock_prev;
     hash_key = history[ply].hash_prev;
