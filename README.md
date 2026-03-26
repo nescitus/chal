@@ -1,6 +1,6 @@
 # Chal
 
-**Chal** is a complete, FIDE-rules-compliant chess engine in **919 lines of C99** it has one file, no dependencies, no magic.
+**Chal** is a complete, FIDE-rules-compliant chess engine in **926 lines of C99** it has one file, no dependencies, no magic.
 
 The name is Gujarati for "move." The goal is not to be the strongest engine, but the most readable one. Every subsystem such as move generation, search, evaluation, UCI fits in a single scroll. The source is written to be studied.
 
@@ -8,7 +8,7 @@ The name is Gujarati for "move." The goal is not to be the strongest engine, but
 
 A lot of minimal engines cut corners: no en passant, no underpromotion, bugged castling after a rook is captured, draw detection that breaks perpetual-check defence. Chal doesn't. It passes all five standard perft positions and handles:
 
-- En passant, all four underpromotions
+- En passant, all three underpromotions (knight, bishop, rook)
 - Castling rights stripped correctly when a rook is captured at its home square
 - 2-fold repetition detection (same hash, same side to move)
 - 50-move rule (halfmove clock maintained incrementally and read from FEN)
@@ -31,6 +31,7 @@ There are no abstractions introduced for their own sake. No classes, no polymorp
 - **0x88 representation** — 128-element array; `sq & 0x88` detects off-board in one operation. No branch, no bounds table.
 - **Transposition table** — TT scores for mate are stored relative to the node that proved them and adjusted on retrieval, so the same mate is recognised correctly regardless of the transposition depth.
 - **Incremental Zobrist hashing** — 64-bit XOR key (Sungorus LCG) updated on every make/undo.
+- **Piece list** — compact list of up to 32 live pieces per side, maintained incrementally by make/undo. Eliminates full-board scans in evaluation and move generation.
 
 ### Move generation
 
@@ -42,48 +43,51 @@ There are no abstractions introduced for their own sake. No classes, no polymorp
 
 - **Negamax alpha-beta** with a triangular PV table. The full planned line is tracked at every node and printed on every `info` line.
 - **Iterative deepening** — depth 1, 2, … up to the limit. Each completed depth feeds the next via the TT best-move, making the overhead near zero.
-- **Aspiration windows** — full window at depths 1–3; ±50 cp window from depth 4. Delta doubles on fail-low or fail-high.
-- **Reverse futility pruning** — at depths 1–7, if static eval − 70·depth ≥ β, prune without searching any moves. Zero nodes spent per pruned node.
-- **Null move pruning** — R=3 (R=4 at depth ≥ 7). Guarded against zugzwang: skipped when the side to move has no non-pawn, non-king piece. Guard is O(1) via incrementally-maintained per-piece-type counts `piece_count[2][6]`. Double null moves prevented by a `was_null` flag.
+- **Aspiration windows** — full window at depths 1–4; ±50 cp window from depth 5. Fails high or low revert to full window.
+- **Reverse futility pruning** — at depths 1–7, if static eval − 70·depth ≥ β, prune without searching any moves.
+- **Null move pruning** — R=3 (R=4 at depth ≥ 7). Guarded against zugzwang: skipped when the side to move has no non-pawn, non-king piece. Guard is O(1) via incrementally-maintained per-piece-type counts `count[2][7]`. Double null moves prevented by a `was_null` flag.
 - **Principal variation search** — first legal move at each node gets the full window; all later moves are probed with a null window and only re-searched at full depth on a fail-high.
-- **Late move reductions (adaptive LMR)** — a precomputed table gives reduction R = round(ln(depth) × ln(move_number) / 1.6), clamped to [1, 5]. Captures, promotions, and check-giving moves are never reduced. R grows an extra ply on non-PV nodes. Any move whose reduced score beats alpha is re-searched at full depth.
-- **Quiescence search** — fail-soft stand-pat with delta pruning.
-- **Repetition detection** — two-tier: inside the search tree one prior occurrence returns draw immediately (opponent can always force a third); in game history before the root, two prior occurrences required (strict threefold). Bounded by the halfmove clock.
+- **Late move reductions (adaptive LMR)** — a precomputed table gives R = round(ln(depth) × ln(move_number) / 1.6), clamped to [1, 5]. Captures, promotions, and check-giving moves are never reduced. R grows an extra ply on non-PV nodes. Any move whose reduced score beats alpha is re-searched at full depth.
+- **Internal iterative reductions (IIR)** — if a node has no TT move and depth ≥ 4, depth is reduced by 1. The resulting TT entry improves ordering on the re-search.
+- **History pruning** — quiet moves with a very negative history score (`< −1024 × depth`) are skipped at shallow depths (depth ≤ 4) outside of check, before `make_move` is called.
+- **Late move pruning (LMP)** — at depth < 4 on non-PV nodes, quiet moves beyond a threshold (`4 × depth + 1`) are skipped if they don't give check.
+- **Razoring** — at depth ≤ 3 on non-PV nodes, if static eval + margin is still below alpha, drop directly into quiescence search.
+- **Quiescence search** — fail-soft stand-pat with delta pruning and pawn-defended pawn pruning (skip non-pawn captures of a pawn defended by another pawn).
+- **Repetition detection** — two-tier: inside the search tree one prior occurrence returns draw immediately; in game history before the root, two prior occurrences required. Bounded by the halfmove clock.
 - **50-move rule** — halfmove clock tracked incrementally in `make_move`, read from FEN field 5; search returns draw score at 100 half-moves.
 
 ### Move ordering
 
 1. TT / hash move — 30 000
-2. MVV-LVA captures — 20 000 + 10 × victim value − attacker value
-3. Queen promotion — 19 999
+2. MVV-LVA captures — 20 000 + 10 × victim value − attacker value; pawn-defended pawn captures scored below killers (−17 000 range)
+3. Promotions — 19 999
 4. Killer move slot 0 — 19 998
 5. Killer move slot 1 — 19 997
-6. History: bonus/malus from beta-cutoff tracking. The cutoff move receives +depth^2 and every quiet move tried before it receives −depth^2 (history malus). Both updates use a formula (diminishing returns) so entries self-correct instead of saturating. Negative scores push failing moves to the bottom of the ordering without ever skipping them.
+6. History — bonus/malus from beta-cutoff tracking. The cutoff move receives `+depth²` and every quiet move tried before it receives `−depth²`. Both updates use a gravity formula so entries self-correct instead of saturating.
 
 ### Transposition table
 
-- 1 048 576 entries (16 MB); power-of-two size for fast `% TT_SIZE` via bitwise AND.
+- 1 048 576 entries (16 MB default); configurable via `setoption name Hash`. Power-of-two size for fast modulo.
 - Stores exact score, upper bound, or lower bound with the best move.
-- Depth-preferred replacement.
+- Depth-preferred replacement. Always stores on fail-low nodes to preserve the best move for future ordering.
 
 ### Evaluation
 
-All terms are from the side-to-move's perspective; middlegame and endgame scores are blended by game phase.
+All terms are from the side-to-move's perspective; midgame and endgame scores are blended by game phase.
 
 - **Tapered evaluation** — separate MG and EG scores blended as `(mg×phase + eg×(24−phase)) / 24`, where phase counts remaining piece material (24 = opening, 0 = pure endgame).
-- **Material** — Rofchade Texel-tuned values: MG P=82 N=337 B=365 R=477 Q=1025; EG P=94 N=281 B=297 R=512 Q=936.
-- **Piece-square tables** — `mg_pst[6][64]` and `eg_pst[6][64]`, Rofchade PeSTO tables with enhanced tuning. Passed pawns receive explicit detection and rank-dependent bonuses.
-- **Pawn evaluation** — includes passed pawn detection (no opposing pawn on the path), with rank-multiplied bonuses and endgame reinforcement for advanced passers.
-- **Mobility** — pseudo-legal reachable squares above a per-piece centre target. Knights, bishops, rooks ±3 cp/sq; queens ±2 cp/sq; applied to both MG and EG.
-- **Bishop pair** — +30 cp in both MG and EG.
-- **Rook activity** — semi-open file +10, open file +20, 7th rank +20; applied to both MG and EG.
-- **Pawn structure** — doubled −20 cp, isolated −10 cp; applied to both MG and EG.
-- **King safety** — pawn-shield check on the three files in front of a castled king; −15 cp per missing pawn, −25 cp extra on a fully open file; MG only (fades naturally with phase).
+- **Material** — Rofchade Texel-tuned values: MG P=82 N=337 B=365 R=477 Q=1025; EG P=94 N=281 B=297 R=513 Q=937.
+- **Piece-square tables** — `mg_pst[6][64]` and `eg_pst[6][64]`, PeSTO tables.
+- **Pawn evaluation** — passed pawn detection (no opposing pawn ahead on same or adjacent file), with rank-dependent bonuses enhanced by king distance in the endgame. Doubled pawns −20 cp, isolated pawns −10 cp (MG and EG).
+- **Mobility** — pseudo-legal reachable squares above a per-piece centre target. Knights, bishops, rooks ±3–4 cp/sq; queens ±2 cp/sq; applied to both MG and EG.
+- **Bishop pair** — +31 MG, +30 EG.
+- **Rook activity** — semi-open file +10, open file +20; applied to both MG and EG.
+- **King safety** — pawn-shield check on the three files in front of a castled king; MG only.
 
 ### Time management
 
 - Reads `wtime`, `btime`, `movestogo`, `winc`, `binc` from the `go` command.
-- Budget = `our_time / movestogo + our_inc × 3/4`, capped 50 ms below the clock floor, minimum 5 ms.
+- Budget = `our_time / movestogo + our_inc × 3/4`, capped 50 ms below the clock floor, minimum 5 ms. Defaults to 30 moves remaining when `movestogo` is absent.
 - Hard abort every 1 024 nodes; soft stop after any depth that consumed more than half the budget.
 - `go depth N` ignores the clock; used by test suites and analysis.
 
@@ -92,17 +96,12 @@ All terms are from the side-to-move's perspective; middlegame and endgame scores
 Requires a C99-compliant compiler.
 
 ```bash
-make
-```
-
-```bash
-# or manually:
-gcc src/chal.c -O2 -Wall -Wextra -pedantic -std=gnu99 -o chal
+gcc chal.c -O2 -Wall -Wextra -pedantic -std=c99 -o chal
 ```
 
 ## UCI
 
-Chal works with any UCI-compatible GUI such as Arena, Cutechess, Banksia or from the terminal directly:
+Chal works with any UCI-compatible GUI such as Arena, Cutechess, Banksia, or from the terminal directly:
 
 ```
 uci
@@ -115,12 +114,12 @@ go wtime 60000 btime 60000 movestogo 40
 
 ## Code map
 
-`src/chal.c` runs linearly so no forward declarations are needed:
+`chal.c` runs linearly so no forward declarations are needed:
 
 | Section | Content |
 |---------|---------|
 | S1 | Constants, types, move encoding, TT, PV, history |
-| S2 | Board state, globals, time-control variables |
+| S2 | Board state, globals, piece list, time-control variables |
 | S3 | Direction vectors and castling tables |
 | S4 | Zobrist hashing |
 | S5 | Attack detection |
@@ -135,7 +134,6 @@ go wtime 60000 btime 60000 movestogo 40
 
 ## Acknowledgements
 
-**Pawel Koziol** ([nescitus](https://github.com/nescitus)) — for thorough testing, bug reports, and architectural guidance throughout development. His feedback directly shaped the killer-move ply-indexing fix, the NMP ply-bookkeeping refactor, the PeSTO evaluation upgrade, the lazy pick-move sort, the history malus + formula in v1.3.1, and the pawn evaluation refinements, state structure refactoring, and search clarity initiatives in v1.3.2.
+**Pawel Koziol** ([nescitus](https://github.com/nescitus)) — for thorough testing, bug reports, and architectural guidance throughout development. His feedback directly shaped the killer-move ply-indexing fix, the NMP ply-bookkeeping refactor, the PeSTO evaluation upgrade, the lazy pick-move sort, the history malus formula in v1.3.1, and the pawn evaluation refinements, state structure refactoring, search clarity initiatives, piece list implementation, and QS pruning improvements in v1.3.3.
 
 **Anik Patel** ([Bobingstern](https://github.com/Bobingstern)) — for guiding the SPRT testing setup using [fastchess](https://github.com/Disservin/fastchess), making it possible to measure strength gains objectively across versions.
-
